@@ -205,6 +205,9 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 	if err != nil {
 		return err
 	}
+	if err := pgLockRoles(txn, owners); err != nil {
+		return err
+	}
 	if err := withRolesGranted(txn, owners, func() error {
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so the role will not lose its
@@ -265,6 +268,10 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 			log.Printf("[WARN] Could not determine object owners during grant delete (object may not exist), treating as already destroyed: %v", err)
 			return nil
 		}
+		return err
+	}
+
+	if err := pgLockRoles(txn, owners); err != nil {
 		return err
 	}
 

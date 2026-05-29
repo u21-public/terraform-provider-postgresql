@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -1478,6 +1479,144 @@ func TestAccPostgresqlGrantOwnerPG15(t *testing.T) {
 			},
 		},
 	})
+}
+
+// TestAccPostgresqlGrantConcurrentOwnerLock verifies that pgLockRoles correctly serializes
+// concurrent grant operations that share the same owner role. This prevents the
+// "tuple concurrently deleted" race condition on pg_auth_members that occurs when
+// withRolesGranted temporarily GRANT/REVOKEs the owner to/from the connected user.
+func TestAccPostgresqlGrantConcurrentOwnerLock(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	// Create a test database with tables owned by a shared owner role.
+	// This mirrors the production scenario (RDS/Aurora) where the provider connects as a
+	// non-superuser and must temporarily assume the owner role to manipulate privileges.
+	dbExecute(t, dsn, "CREATE ROLE test_lock_owner")
+	dbExecute(t, dsn, "CREATE DATABASE test_lock_db")
+
+	dbDsn := config.connStr("test_lock_db")
+	dbExecute(t, dbDsn, "CREATE SCHEMA test_schema")
+	dbExecute(t, dbDsn, "ALTER SCHEMA test_schema OWNER TO test_lock_owner")
+
+	numTables := 5
+	for i := 0; i < numTables; i++ {
+		dbExecute(t, dbDsn, fmt.Sprintf("CREATE TABLE test_schema.table_%d (id int)", i))
+		dbExecute(t, dbDsn, fmt.Sprintf("ALTER TABLE test_schema.table_%d OWNER TO test_lock_owner", i))
+	}
+
+	numGrantees := 5
+	for i := 0; i < numGrantees; i++ {
+		dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_lock_grantee_%d", i))
+		dbExecute(t, dbDsn, fmt.Sprintf("GRANT USAGE ON SCHEMA test_schema TO test_lock_grantee_%d", i))
+	}
+
+	defer func() {
+		dbExecute(t, dsn, "DROP DATABASE IF EXISTS test_lock_db")
+		for i := 0; i < numGrantees; i++ {
+			dbExecute(t, dsn, fmt.Sprintf("DROP ROLE IF EXISTS test_lock_grantee_%d", i))
+		}
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_lock_owner")
+	}()
+
+	// Verify that pgLockRoles serializes concurrent operations on the same owner.
+	// Each goroutine acquires the owner lock, then performs a privilege grant.
+	// Without pgLockRoles, these operations would interleave on pg_auth_members.
+	// With pgLockRoles, they serialize correctly.
+	var concurrentErrors []error
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for granteeIdx := 0; granteeIdx < numGrantees; granteeIdx++ {
+		wg.Add(1)
+		go func(granteeIdx int) {
+			defer wg.Done()
+			grantee := fmt.Sprintf("test_lock_grantee_%d", granteeIdx)
+
+			db, err := sql.Open("postgres", dbDsn)
+			if err != nil {
+				mu.Lock()
+				concurrentErrors = append(concurrentErrors, fmt.Errorf("grantee %s: connect: %w", grantee, err))
+				mu.Unlock()
+				return
+			}
+			defer db.Close()
+
+			for tableIdx := 0; tableIdx < numTables; tableIdx++ {
+				txn, err := db.Begin()
+				if err != nil {
+					mu.Lock()
+					concurrentErrors = append(concurrentErrors, fmt.Errorf("grantee %s table_%d: begin: %w", grantee, tableIdx, err))
+					mu.Unlock()
+					return
+				}
+
+				// Acquire the owner lock (this is what our fix adds)
+				if err := pgLockRoles(txn, []string{"test_lock_owner"}); err != nil {
+					txn.Rollback()
+					mu.Lock()
+					concurrentErrors = append(concurrentErrors, fmt.Errorf("grantee %s table_%d: lock owner: %w", grantee, tableIdx, err))
+					mu.Unlock()
+					return
+				}
+
+				// Grant privilege (as superuser, withRolesGranted is skipped but the lock
+				// still ensures serialization on the owner)
+				if _, err := txn.Exec(fmt.Sprintf(
+					"GRANT SELECT ON %s.%s TO %s",
+					pq.QuoteIdentifier("test_schema"),
+					pq.QuoteIdentifier(fmt.Sprintf("table_%d", tableIdx)),
+					pq.QuoteIdentifier(grantee),
+				)); err != nil {
+					txn.Rollback()
+					mu.Lock()
+					concurrentErrors = append(concurrentErrors, fmt.Errorf("grantee %s table_%d: grant: %w", grantee, tableIdx, err))
+					mu.Unlock()
+					return
+				}
+
+				if err := txn.Commit(); err != nil {
+					mu.Lock()
+					concurrentErrors = append(concurrentErrors, fmt.Errorf("grantee %s table_%d: commit: %w", grantee, tableIdx, err))
+					mu.Unlock()
+					return
+				}
+			}
+		}(granteeIdx)
+	}
+
+	wg.Wait()
+
+	if len(concurrentErrors) > 0 {
+		for _, err := range concurrentErrors {
+			t.Logf("concurrent grant error: %v", err)
+		}
+		t.Fatalf("got %d errors during concurrent grant operations", len(concurrentErrors))
+	}
+
+	// Verify all grants were applied correctly
+	db, err := sql.Open("postgres", dbDsn)
+	if err != nil {
+		t.Fatalf("could not connect to verify grants: %v", err)
+	}
+	defer db.Close()
+
+	for granteeIdx := 0; granteeIdx < numGrantees; granteeIdx++ {
+		grantee := fmt.Sprintf("test_lock_grantee_%d", granteeIdx)
+		var count int
+		err := db.QueryRow(`
+			SELECT count(*) FROM information_schema.role_table_grants
+			WHERE grantee = $1 AND table_schema = 'test_schema' AND privilege_type = 'SELECT'
+		`, grantee).Scan(&count)
+		if err != nil {
+			t.Fatalf("could not query grants for %s: %v", grantee, err)
+		}
+		if count != numTables {
+			t.Errorf("expected %d grants for %s, got %d", numTables, grantee, count)
+		}
+	}
 }
 
 func testCheckDatabasesPrivileges(t *testing.T, canCreate bool) func(*terraform.State) error {

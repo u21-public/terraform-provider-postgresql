@@ -615,6 +615,27 @@ func pgLockDatabase(txn *sql.Tx, database string) error {
 	return nil
 }
 
+// pgLockRoles acquires advisory locks on the given roles, sorted by OID to prevent deadlocks.
+func pgLockRoles(txn *sql.Tx, roles []string) error {
+	if len(roles) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(roles))
+	args := make([]any, len(roles))
+	for i, role := range roles {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = role
+	}
+	query := fmt.Sprintf(
+		"SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname IN (%s) ORDER BY oid",
+		strings.Join(placeholders, ","),
+	)
+	if _, err := txn.Exec(query, args...); err != nil {
+		return fmt.Errorf("could not get advisory lock for roles %v: %w", roles, err)
+	}
+	return nil
+}
+
 func arrayDifference(a, b []any) (diff []any) {
 	m := make(map[any]bool)
 
