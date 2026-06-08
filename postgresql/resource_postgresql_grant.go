@@ -477,7 +477,10 @@ JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
 LEFT JOIN (
     select acls.*
     from (
-             SELECT proname, pronamespace, (aclexplode(proacl)).* FROM pg_proc
+             SELECT p.proname, p.pronamespace, (aclexplode(p.proacl)).*
+             FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = $2 AND p.proacl IS NOT NULL
          ) acls
     WHERE grantee = $1
 ) privs
@@ -499,7 +502,10 @@ FROM pg_class
 JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
 LEFT JOIN (
     SELECT acls.* FROM (
-        SELECT relname, relnamespace, relkind, (aclexplode(relacl)).* FROM pg_class c
+        SELECT c.relname, c.relnamespace, c.relkind, (aclexplode(c.relacl)).*
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $2 AND c.relkind = $3 AND c.relacl IS NOT NULL
     ) as acls
     WHERE grantee=$1
 ) privs
