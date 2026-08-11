@@ -495,6 +495,19 @@ GROUP BY pg_proc.proname
 	case "column":
 		return readColumnRolePrivileges(txn, d)
 
+	case "table":
+		query = `
+SELECT table_name, array_remove(array_agg(privilege_type), NULL)
+FROM information_schema.tables
+	LEFT JOIN (
+		pg_class c LEFT JOIN LATERAL aclexplode(c.relacl) a ON grantee = $1
+	) ON c.relname = table_name
+WHERE table_schema = $2 GROUP BY table_name
+`
+		rows, err = txn.Query(
+			query, roleOID, d.Get("schema"),
+		)
+
 	default:
 		query = `
 SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)
