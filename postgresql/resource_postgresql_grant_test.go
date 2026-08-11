@@ -3,7 +3,9 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1590,5 +1592,94 @@ func testCheckForeignServerPrivileges(t *testing.T, usage bool) func(*terraform.
 		}
 
 		return nil
+	}
+}
+
+// tableGrantsFor runs one of the grant-read queries and returns a map of
+// table name -> sorted privilege list, so the "table" query and the legacy generic
+// query can be compared for exact equivalence.
+func tableGrantsFor(t *testing.T, db *sql.DB, query string, args ...any) map[string][]string {
+	t.Helper()
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		t.Fatalf("could not run grants query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	result := map[string][]string{}
+	for rows.Next() {
+		var name string
+		var privs pq.ByteaArray
+		if err := rows.Scan(&name, &privs); err != nil {
+			t.Fatalf("could not scan grants row: %v", err)
+		}
+		strs := make([]string, 0, len(privs))
+		for _, p := range privs {
+			strs = append(strs, string(p))
+		}
+		sort.Strings(strs)
+		result[name] = strs
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("error iterating grants rows: %v", err)
+	}
+	return result
+}
+
+// TestAccReadTableGrantsMatchesLegacy confirms the "table" object_type read query
+// (readTableGrantsQuery) returns exactly the same (table -> privileges) result as the
+// legacy generic query (readObjectGrantsQuery) for ordinary tables in a schema.
+//
+// Note: equivalence holds for ordinary tables (relkind 'r'). The two queries diverge by
+// design for views / partitioned / foreign tables, which information_schema.tables
+// includes but the legacy relkind='r' filter excludes; this test only creates ordinary
+// tables.
+func TestAccReadTableGrantsMatchesLegacy(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	tables := []string{"table_no_grants", "table_select", "table_multi", "table_all"}
+	dropTables := createTestTables(t, dbSuffix, tables, "")
+	defer dropTables()
+
+	dsn := config.connStr(dbName)
+	// Assorted privileges, including a table with none (verifies empty arrays match)
+	// and a table with the full set.
+	dbExecute(t, dsn, fmt.Sprintf("GRANT SELECT ON table_select TO %s", roleName))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT SELECT, INSERT, UPDATE ON table_multi TO %s", roleName))
+	dbExecute(t, dsn, fmt.Sprintf("GRANT ALL ON table_all TO %s", roleName))
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("could not open connection to %s: %v", dbName, err)
+	}
+	defer closeDB(t, db)
+
+	roleOID, err := getRoleOID(db, roleName)
+	if err != nil {
+		t.Fatalf("could not get OID for role %s: %v", roleName, err)
+	}
+
+	got := tableGrantsFor(t, db, readTableGrantsQuery, roleOID, "public")
+	want := tableGrantsFor(t, db, readObjectGrantsQuery, roleOID, "public", objectTypes["table"])
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf(
+			"table read query does not match legacy query:\n  table query:  %#v\n  legacy query: %#v",
+			got, want,
+		)
+	}
+
+	// Guard against a vacuous pass (two empty maps): assert the fixtures were actually read.
+	if len(want) != len(tables) {
+		t.Fatalf("expected %d tables in results, got %d: %#v", len(tables), len(want), want)
+	}
+	if privs, ok := want["table_select"]; !ok || !reflect.DeepEqual(privs, []string{"SELECT"}) {
+		t.Fatalf("expected table_select to have exactly [SELECT], got %#v (present=%v)", privs, ok)
 	}
 }

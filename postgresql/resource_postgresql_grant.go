@@ -443,6 +443,37 @@ ORDER BY col_privs.attname
 	return nil
 }
 
+// readTableGrantsQuery returns, for a grantee role OID ($1) and schema ($2), every table
+// in that schema together with the set of privileges currently granted to the role.
+const readTableGrantsQuery = `
+SELECT table_name, array_remove(array_agg(privilege_type), NULL)
+FROM information_schema.tables
+	LEFT JOIN (
+		pg_class c LEFT JOIN LATERAL aclexplode(c.relacl) a ON grantee = $1
+	) ON c.relname = table_name
+WHERE table_schema = $2 GROUP BY table_name
+`
+
+// readObjectGrantsQuery is the generic per-object read used for object types other than
+// tables (sequence, type, ...). It filters by grantee ($1), schema ($2) and relkind ($3).
+const readObjectGrantsQuery = `
+SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)
+FROM pg_class
+JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+LEFT JOIN (
+    SELECT acls.* FROM (
+        SELECT c.relname, c.relnamespace, c.relkind, (aclexplode(c.relacl)).*
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $2 AND c.relkind = $3 AND c.relacl IS NOT NULL
+    ) as acls
+    WHERE grantee=$1
+) privs
+USING (relname, relnamespace, relkind)
+WHERE nspname = $2 AND relkind = $3
+GROUP BY pg_class.relname
+`
+
 func readRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 	role := d.Get("role").(string)
 	objectType := d.Get("object_type").(string)
@@ -495,24 +526,14 @@ GROUP BY pg_proc.proname
 	case "column":
 		return readColumnRolePrivileges(txn, d)
 
+	case "table":
+		query = readTableGrantsQuery
+		rows, err = txn.Query(
+			query, roleOID, d.Get("schema"),
+		)
+
 	default:
-		query = `
-SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)
-FROM pg_class
-JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
-LEFT JOIN (
-    SELECT acls.* FROM (
-        SELECT c.relname, c.relnamespace, c.relkind, (aclexplode(c.relacl)).*
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = $2 AND c.relkind = $3 AND c.relacl IS NOT NULL
-    ) as acls
-    WHERE grantee=$1
-) privs
-USING (relname, relnamespace, relkind)
-WHERE nspname = $2 AND relkind = $3
-GROUP BY pg_class.relname
-`
+		query = readObjectGrantsQuery
 		rows, err = txn.Query(
 			query, roleOID, d.Get("schema"), objectTypes[objectType],
 		)
