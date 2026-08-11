@@ -1604,7 +1604,7 @@ func tableGrantsFor(t *testing.T, db *sql.DB, query string, args ...any) map[str
 	if err != nil {
 		t.Fatalf("could not run grants query: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := map[string][]string{}
 	for rows.Next() {
