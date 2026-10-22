@@ -1,6 +1,6 @@
 module github.com/terraform-providers/terraform-provider-postgresql
 
-go 1.25.8
+go 1.27.3
 
 toolchain go1.27.3
 
