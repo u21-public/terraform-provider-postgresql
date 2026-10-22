@@ -8,3 +8,12 @@ linters:
     errcheck:
       exclude-functions:
         - (*github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema.ResourceData).Set
+  exclusions:
+    rules:
+      # The provider intentionally uses the legacy (non-Context) CRUD funcs of
+      # terraform-plugin-sdk/v2. These SA1019 deprecation warnings are not
+      # flagged by older golangci-lint and are out of scope for the toolchain
+      # bump; exclude them so the lint scope matches prior behavior.
+      - linters:
+          - staticcheck
+        text: 'SA1019:.*terraform-plugin-sdk/v2/helper/(schema|resource)'
